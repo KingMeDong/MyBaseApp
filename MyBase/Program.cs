@@ -55,7 +55,7 @@ builder.Services.AddSingleton(cpapiCookies);
 builder.Services.AddHttpClient("Cpapi", (sp, c) => {
     var opt = sp.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<CpapiOptions>>().CurrentValue;
     c.BaseAddress = new Uri(opt.BaseUrl);
-    c.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "MyBaseBot/1.0");
+    c.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
     c.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, text/plain, */*");
     c.DefaultRequestHeaders.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
 })
@@ -424,6 +424,56 @@ app.MapGet("/api/backfill/status/{id:guid}", (BackfillStatusStore store, Guid id
         st.Source,
         st.CreatedUtc,
         st.FinishedUtc
+    });
+});
+
+// --- ANALYSIS TEST RUNNER ---
+app.MapGet("/api/analysis/test", async (AppDbContext db) => {
+    // 1. Daten laden (letzte 1000 Bars vom ersten aktiven Instrument)
+    var inst = await db.Instruments.AsNoTracking().Where(i => i.IsActive).FirstOrDefaultAsync();
+    if (inst == null) return Results.BadRequest("No active instrument");
+
+    var bars = await db.Bars1m.AsNoTracking()
+        .Where(b => b.InstrumentId == inst.Id)
+        .OrderByDescending(b => b.TsUtc)
+        .Take(1000)
+        .ToListAsync();
+    
+    // Sortieren für die Analyse (alt -> neu)
+    bars.Reverse();
+
+    // 2. Detectors instanziieren
+    var fvgDetector = new MyBase.Services.Trading.Analysis.FvgDetector(minGapTicks: 1);
+    var structDetector = new MyBase.Services.Trading.Analysis.StructureDetector(leftBars: 3, rightBars: 3);
+
+    // 3. Analyse laufen lassen
+    // Wir iterieren durch die Historie, um zu simulieren, wie es live wäre
+    // (Ein echter Backtest würde das effizienter machen, aber für den Test ok)
+    var signals = new List<MyBase.Services.Trading.Analysis.Signal>();
+    
+    // Fenster über die Bars schieben
+    // Fenster über die Bars schieben
+    // Wir brauchen min. 7 Bars für Structure (3+1+3)
+    for (int i = 7; i <= bars.Count; i++) {
+        var window = bars.Skip(i - 7).Take(7).ToList(); // Fenstergröße anpassen wenn nötig, aber Detect nimmt eh die ganze Liste
+        
+        // FVG braucht nur 3, aber wir können ihm auch 7 geben (er nimmt die letzten 3)
+        // ACHTUNG: Detect erwartet eine Liste und prüft oft am Ende.
+        // Um effizient zu sein, übergeben wir hier einfach das Fenster.
+        // Besser wäre: Detect(bars, currentIndex) -> aber unser Interface ist Detect(List<Bar>)
+        
+        // Workaround für Test: Wir geben immer das aktuelle Fenster rein.
+        // FVG schaut auf die letzten 3.
+        // Structure schaut auf die Mitte (i-4).
+        
+        signals.AddRange(fvgDetector.Detect(window));
+        signals.AddRange(structDetector.Detect(window));
+    }
+
+    return Results.Ok(new {
+        barsAnalysed = bars.Count,
+        signalsFound = signals.Count,
+        signals = signals.OrderByDescending(s => s.TsUtc) // Neueste zuerst
     });
 });
 

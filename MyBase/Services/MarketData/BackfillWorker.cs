@@ -85,14 +85,18 @@ namespace MyBase.Services.MarketData {
                     SafeLog($"BackfillWorker: Job angenommen (JobId={st.JobId}, {inst.Symbol}, {req.StartUtc:u} → {req.EndUtc:u}, RTH={(req.RthOnly ? "true" : "false")}).");
 
                     // --- HMDS Call: midpoint (stabil, ohne Volumen) ---
+                    // NEU: Wir nutzen den offiziellen /iserver/ Endpoint statt /hmds/
                     const string period = "5m";
                     const string bar = "1min";
                     const string barType = "midpoint"; // stabil; liefert kein 'v'
                     var outsideRth = (!req.RthOnly).ToString().ToLowerInvariant();
 
                     var client = _http.CreateClient("Cpapi");
-                    var url = $"/v1/api/hmds/history?conid={inst.IbConId}&period={period}&bar={bar}&outsideRth={outsideRth}&barType={barType}";
-                    SafeLog($"HMDS GET {url}");
+                    // ALT: /v1/api/hmds/history
+                    // NEU: /v1/api/iserver/marketdata/history
+                    var url = $"/v1/api/iserver/marketdata/history?conid={inst.IbConId}&period={period}&bar={bar}&outsideRth={outsideRth}&barType={barType}";
+                    
+                    SafeLog($"Backfill: Requesting {url}");
 
                     List<Candle> candles;
                     try {
@@ -221,23 +225,23 @@ namespace MyBase.Services.MarketData {
 
                     if (r.IsSuccessStatusCode) {
                         var list = ParseHistory(body);
-                        SafeLog($"BackfillWorker: HMDS OK ({code}) – {list.Count} Bars empfangen.");
+                        SafeLog($"Backfill: OK ({code}) – {list.Count} Bars empfangen.");
                         return list;
                     }
 
                     // 5xx -> Retry, 429 -> kurzer Backoff
                     if (code >= 500 || code == 429) {
-                        SafeLog($"BackfillWorker: HMDS {code} – Retry {attempt}/3 …");
-                        await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
+                        SafeLog($"Backfill: Server Error {code} – Retry {attempt}/3. Body: {TrimForLog(body)}");
+                        await Task.Delay(TimeSpan.FromMilliseconds(2000 * attempt), ct); // Noch längeres Delay
                         continue;
                     }
 
                     // andere Codes: protokollieren und zurück
-                    SafeLog($"BackfillWorker: HMDS miss {code} :: {TrimForLog(body)}");
+                    SafeLog($"Backfill: Fehler {code} :: {TrimForLog(body)}");
                     return new List<Candle>();
                 } catch (Exception ex) when (attempt < 3) {
-                    SafeLog($"BackfillWorker: HMDS EX (Versuch {attempt}/3) – {ex.Message}");
-                    await Task.Delay(TimeSpan.FromMilliseconds(300 * attempt), ct);
+                    SafeLog($"Backfill: Exception (Versuch {attempt}/3) – {ex.Message}");
+                    await Task.Delay(TimeSpan.FromMilliseconds(1000 * attempt), ct);
                 } catch (Exception ex) {
                     SafeLog($"BackfillWorker: HMDS EX – {ex.Message}");
                     break;

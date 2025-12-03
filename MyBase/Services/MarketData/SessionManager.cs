@@ -1,4 +1,5 @@
-﻿using System.Net.Http.Json;
+﻿using System.Net; // Für CookieContainer
+using System.Net.Http.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using MyBase.Data;
@@ -12,6 +13,7 @@ public class SessionManager : BackgroundService {
     private readonly ILogger<SessionManager> _log;
     private readonly TimeSpan _heartbeat;
     private readonly TimeSpan _statusPoll;
+    private readonly CookieContainer _cookies; // Store reference to clear cookies
 
     private SessionState _state = SessionState.Disconnected;
     public SessionState State => _state;
@@ -20,11 +22,13 @@ public class SessionManager : BackgroundService {
         IHttpClientFactory httpFactory,
         IServiceProvider sp,
         ILogger<SessionManager> log,
-        IOptionsMonitor<CpapiOptions> opt
+        IOptionsMonitor<CpapiOptions> opt,
+        CookieContainer cookies // Inject CookieContainer
     ) {
         _httpFactory = httpFactory;
         _sp = sp;
         _log = log;
+        _cookies = cookies;
 
         var cfg = opt.CurrentValue;
         _heartbeat = TimeSpan.FromSeconds(cfg.HeartbeatSeconds);
@@ -36,7 +40,7 @@ public class SessionManager : BackgroundService {
         var lastTickle = DateTime.MinValue;
         var lastStatus = DateTime.MinValue;
 
-        SessionLogBuffer.Info("SM", "START", "SessionManager gestartet");
+        SessionLogBuffer.Info("SM", "START", "SessionManager gestartet", ("BaseUrl", client.BaseAddress?.ToString() ?? "null"));
 
         while (!stoppingToken.IsCancellationRequested) {
             try {
@@ -53,23 +57,25 @@ public class SessionManager : BackgroundService {
 
                 // 1) SSO prüfen/verlängern
                 var ssoOk = await EnsureSsoAsync(client, stoppingToken);
-                if (!ssoOk) {
-                    if (_state != SessionState.NeedsLogin)
-                        SessionLogBuffer.Warn("SM", "SSO", "invalid", ("state", _state));
-                    _state = SessionState.NeedsLogin;
-                } else {
-                    // 2) Brokerage-Auth-Status in Intervallen (bei Nicht-Connected schneller)
-                    var fastProbe = _state != SessionState.Connected;
-                    var due = fastProbe ? TimeSpan.FromSeconds(5) : _statusPoll;
+                
+                // Wenn SSO fehlschlägt (z.B. 401), MÜSSEN wir ProbeAuthAsync aufrufen, damit Reauthenticate passiert!
+                // Wir erzwingen den Check, wenn ssoOk false ist.
+                
+                var fastProbe = _state != SessionState.Connected || !ssoOk;
+                var due = fastProbe ? TimeSpan.FromSeconds(5) : _statusPoll;
 
-                    if ((DateTime.UtcNow - lastStatus) > due) {
-                        var before = _state;
-                        var next = await ProbeAuthAsync(client, stoppingToken);
-                        if (next != before)
-                            SessionLogBuffer.Info("SM", "STATE", "probe transition", ("from", before), ("to", next));
-                        _state = next;
-                        lastStatus = DateTime.UtcNow;
+                if (!ssoOk || (DateTime.UtcNow - lastStatus) > due) {
+                    if (!ssoOk && _state != SessionState.NeedsLogin) {
+                         SessionLogBuffer.Warn("SM", "SSO", "invalid -> forcing auth probe", ("state", _state));
+                         _state = SessionState.NeedsLogin;
                     }
+
+                    var before = _state;
+                    var next = await ProbeAuthAsync(client, stoppingToken);
+                    if (next != before)
+                        SessionLogBuffer.Info("SM", "STATE", "probe transition", ("from", before), ("to", next));
+                    _state = next;
+                    lastStatus = DateTime.UtcNow;
                 }
 
                 // 3) Heartbeat/Tickle senden, wenn verbunden
@@ -113,6 +119,13 @@ public class SessionManager : BackgroundService {
                     LogLevel.Info, "SM", "SSO", "validate ok");
                 return true;
             }
+            if (res.StatusCode == System.Net.HttpStatusCode.Unauthorized) {
+                SessionLogBuffer.Warn("SM", "SSO", "401 Unauthorized -> Triggering Re-Auth");
+                // Wir können den Container nicht einfach leeren (readonly/singleton), 
+                // aber wir können den State so setzen, dass Reauthenticate versucht wird.
+                return false;
+            }
+            
             SessionLogBuffer.Warn("SM", "SSO", "validate http", ("code", (int)res.StatusCode));
             return false;
         } catch (Exception ex) {
@@ -152,6 +165,11 @@ public class SessionManager : BackgroundService {
             var res = await c.GetAsync("/v1/api/iserver/auth/status", ct);
             if (!res.IsSuccessStatusCode) {
                 SessionLogBuffer.Warn("SM", "AUTH", "http", ("code", (int)res.StatusCode));
+                // FIX: Bei 401 (Unauthorized) müssen wir so tun, als wären wir nicht authentifiziert,
+                // damit der Caller (ProbeAuthAsync) das Re-Auth triggert.
+                if (res.StatusCode == System.Net.HttpStatusCode.Unauthorized) {
+                    return (true, false, false); // "ok=true" damit wir das Ergebnis nutzen, "auth=false" damit Reauth passiert
+                }
                 return (false, false, false);
             }
             var json = await res.Content.ReadFromJsonAsync<AuthStatus>(cancellationToken: ct);
