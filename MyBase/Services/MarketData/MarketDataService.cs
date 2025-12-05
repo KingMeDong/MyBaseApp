@@ -115,8 +115,8 @@ namespace MyBase.Services.MarketData {
         private async Task RunSnapshotLoopAsync(Instrument inst, CancellationToken ct) {
             SessionLogBuffer.Info("RT", "SNAP_START", "start snapshot poll", ("symbol", inst.Symbol), ("conid", inst.IbConId));
 
-            // FeedState -> Running + initialer Heartbeat
-            await UpdateFeedStateAsync(inst.Id, status: 1, heartbeatUtc: DateTime.UtcNow);
+            // FeedState -> Running + initialer Heartbeat + Fehler löschen
+            await UpdateFeedStateAsync(inst.Id, status: 1, heartbeatUtc: DateTime.UtcNow, clearError: true);
 
             var client = _http.CreateClient("Cpapi");
 
@@ -370,14 +370,16 @@ namespace MyBase.Services.MarketData {
             }
         }
 
-        private async Task UpdateFeedStateAsync(int instrumentId, byte? status = null, DateTime? heartbeatUtc = null, string? error = null) {
+        private async Task UpdateFeedStateAsync(int instrumentId, byte? status = null, DateTime? heartbeatUtc = null, string? error = null, bool clearError = false) {
             using var scope = _sp.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
             var fs = await db.FeedStates.FindAsync(instrumentId) ?? new FeedState { InstrumentId = instrumentId };
             if (status.HasValue) fs.Status = status.Value;
             if (heartbeatUtc.HasValue) fs.LastHeartbeatUtc = heartbeatUtc;
-            if (error != null) fs.LastError = error;
+            
+            if (clearError) fs.LastError = null;
+            else if (error != null) fs.LastError = error;
 
             db.Update(fs);
             await db.SaveChangesAsync();

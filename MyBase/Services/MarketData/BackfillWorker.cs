@@ -18,11 +18,10 @@ using MyBase.Models.Finance;
 namespace MyBase.Services.MarketData {
 
     /// <summary>
-    /// BackfillWorker (stabil, ohne Volumen):
-    /// - HMDS-Call: period=5m, bar=1min, barType=midpoint (keine Volumina)
-    /// - Robustere Logs und Guards
+    /// BackfillWorker (Daily Chunking):
+    /// - Iteriert Tag für Tag durch den Zeitraum (period=1d, bar=1min)
+    /// - Robustere Retries pro Tag
     /// - Realtime-Zeilen werden niemals überschrieben
-    /// - EF-Updates sind selektiv (kein versehentliches Überschreiben von IngestSource)
     /// </summary>
     public sealed class BackfillWorker : BackgroundService {
         private readonly IServiceProvider _sp;
@@ -44,7 +43,6 @@ namespace MyBase.Services.MarketData {
             _http = http;
         }
 
-        // ------------------------------ Lifecycle ------------------------------
         protected override async Task ExecuteAsync(CancellationToken ct) {
             SafeLog("BackfillWorker: gestartet (warte auf Aufträge).");
 
@@ -78,130 +76,59 @@ namespace MyBase.Services.MarketData {
                         st.InstrumentSymbol = inst.Symbol;
                     } catch (Exception ex) {
                         MarkFail(st, $"Instrument-Lookup fehlgeschlagen: {ex.Message}");
-                        _log.LogError(ex, "Instrument lookup failed");
                         continue;
                     }
 
-                    SafeLog($"BackfillWorker: Job angenommen (JobId={st.JobId}, {inst.Symbol}, {req.StartUtc:u} → {req.EndUtc:u}, RTH={(req.RthOnly ? "true" : "false")}).");
-
-                    // --- HMDS Call: midpoint (stabil, ohne Volumen) ---
-                    // NEU: Wir nutzen den offiziellen /iserver/ Endpoint statt /hmds/
-                    const string period = "5m";
-                    const string bar = "1min";
-                    const string barType = "midpoint"; // stabil; liefert kein 'v'
-                    var outsideRth = (!req.RthOnly).ToString().ToLowerInvariant();
+                    SafeLog($"BackfillWorker: Job angenommen (JobId={st.JobId}, {inst.Symbol}, {req.StartUtc:u} → {req.EndUtc:u}).");
 
                     var client = _http.CreateClient("Cpapi");
-                    // ALT: /v1/api/hmds/history
-                    // NEU: /v1/api/iserver/marketdata/history
-                    var url = $"/v1/api/iserver/marketdata/history?conid={inst.IbConId}&period={period}&bar={bar}&outsideRth={outsideRth}&barType={barType}";
                     
-                    SafeLog($"Backfill: Requesting {url}");
+                    // Tageweise iterieren
+                    var currentDay = req.StartUtc.Date;
+                    var endDay = req.EndUtc.Date;
+                    
+                    int totalFetched = 0;
+                    int totalInserted = 0;
+                    int totalUpdated = 0;
+                    int totalSkipped = 0;
 
-                    List<Candle> candles;
-                    try {
-                        candles = await FetchHmdsByPeriodAsync(client, url, ct);
-                    } catch (Exception ex) {
-                        MarkFail(st, $"HMDS-Request fehlgeschlagen: {ex.Message}");
-                        _log.LogError(ex, "HMDS request failed");
-                        continue;
-                    }
+                    while (currentDay <= endDay && !ct.IsCancellationRequested) {
+                        SafeLog($"Backfill: Bearbeite Tag {currentDay:yyyy-MM-dd}...");
 
-                    // Trim auf gewünschten Zeitraum (auch wenn HMDS relativ zu 'jetzt' liefert)
-                    var trimmed = candles
-                        .Where(c => c.TsUtc >= req.StartUtc && c.TsUtc <= req.EndUtc)
-                        .GroupBy(c => c.TsUtc)
-                        .Select(g => g.First())
-                        .OrderBy(c => c.TsUtc)
-                        .ToList();
-
-                    if (trimmed.Count == 0) {
-                        SafeLog("BackfillWorker: Hinweis – 0 Bars im Zielzeitraum. (Server evtl. leer/cached; Job wird ohne Fehler abgeschlossen.)");
-                        st.IncSegmentDone();
-                        _status.TrySetFinished(st.JobId, BackfillJobState.Done);
-                        continue;
-                    }
-
-                    // --- Upsert ---
-                    try {
-                        var fromUtc = trimmed.First().TsUtc;
-                        var toUtc = trimmed.Last().TsUtc;
-
-                        // existierende Rows (inkl. Quelle) im Bereich
-                        var existingRows = await db.Bars1m
-                            .Where(b => b.InstrumentId == inst.Id && b.TsUtc >= fromUtc && b.TsUtc <= toUtc)
-                            .Select(b => new { b.TsUtc, b.IngestSource })
-                            .ToListAsync(ct);
-
-                        var existingMap = existingRows.ToDictionary(x => x.TsUtc, x => x.IngestSource);
-
-                        var toInsert = new List<Bar1m>(trimmed.Count);
-                        var toUpdate = new List<Bar1m>();
-                        int skippedRealtime = 0;
-
-                        foreach (var c in trimmed) {
-                            var tsNy = IctTime.ToNy(c.TsUtc);
-                            var sess = IctTime.SessionOf(tsNy);
-                            var kz = IctTime.KillzoneOf(tsNy);
-
-                            var row = new Bar1m {
-                                InstrumentId = inst.Id,
-                                TsUtc = c.TsUtc,
-                                TsNy = tsNy,
-                                Open = (decimal)c.O,
-                                High = (decimal)c.H,
-                                Low = (decimal)c.L,
-                                Close = (decimal)c.C,
-                                Volume = 0, // midpoint -> kein Volumen
-                                Session = sess,
-                                Killzone = kz,
-                                IngestSource = req.Source ?? "backfill"
-                            };
-
-                            if (existingMap.TryGetValue(c.TsUtc, out var src)) {
-                                if (string.Equals(src, "realtime", StringComparison.OrdinalIgnoreCase)) {
-                                    skippedRealtime++;
-                                    continue; // Realtime NIE überschreiben
-                                }
-                                toUpdate.Add(row);
-                            } else {
-                                toInsert.Add(row);
-                            }
+                        // 1. Fetch Day
+                        List<Candle> dayCandles;
+                        try {
+                            dayCandles = await FetchDailyChunkAsync(client, inst.IbConId, currentDay, req.RthOnly, ct);
+                        } catch (Exception ex) {
+                            SafeLog($"Backfill: Fehler beim Abrufen von {currentDay:yyyy-MM-dd}: {ex.Message}");
+                            currentDay = currentDay.AddDays(1);
+                            continue;
                         }
 
-                        if (toInsert.Count > 0)
-                            await db.Bars1m.AddRangeAsync(toInsert, ct);
-
-                        if (toUpdate.Count > 0) {
-                            foreach (var e in toUpdate) {
-                                db.Bars1m.Attach(e);
-                                db.Entry(e).Property(x => x.TsNy).IsModified = true;
-                                db.Entry(e).Property(x => x.Open).IsModified = true;
-                                db.Entry(e).Property(x => x.High).IsModified = true;
-                                db.Entry(e).Property(x => x.Low).IsModified = true;
-                                db.Entry(e).Property(x => x.Close).IsModified = true;
-                                db.Entry(e).Property(x => x.Volume).IsModified = true; // bleibt 0 (midpoint)
-                                db.Entry(e).Property(x => x.Session).IsModified = true;
-                                db.Entry(e).Property(x => x.Killzone).IsModified = true;
-
-                                // Quelle niemals überschreiben
-                                db.Entry(e).Property(x => x.IngestSource).IsModified = false;
-                            }
+                        if (dayCandles.Count == 0) {
+                            SafeLog($"Backfill: Keine Daten für {currentDay:yyyy-MM-dd}.");
+                        } else {
+                            totalFetched += dayCandles.Count;
+                            // 2. Save Day
+                            var (ins, upd, skip) = await SaveBarsAsync(db, inst.Id, dayCandles, req.Source ?? "backfill", ct);
+                            totalInserted += ins;
+                            totalUpdated += upd;
+                            totalSkipped += skip;
                         }
 
-                        await db.SaveChangesAsync(ct);
-                        db.ChangeTracker.Clear();
-
-                        SafeLog($"BackfillWorker: gespeichert (inserted={toInsert.Count}, updated={toUpdate.Count}, skippedRealtime={skippedRealtime}).");
-                    } catch (Exception ex) {
-                        MarkFail(st, $"DB-Speichern fehlgeschlagen: {ex.Message}");
-                        _log.LogError(ex, "DB save failed");
-                        continue;
+                        st.IncSegmentDone(); // Fortschritt grob tracken
+                        
+                        // Nächster Tag
+                        currentDay = currentDay.AddDays(1);
+                        
+                        // Pacing
+                        await Task.Delay(300, ct);
                     }
 
-                    st.IncSegmentDone();
                     _status.TrySetFinished(st.JobId, BackfillJobState.Done);
                     SafeLog($"BackfillWorker: Job abgeschlossen (JobId={st.JobId}).");
+                    SafeLog($"BackfillWorker: SUMMARY -> Fetched={totalFetched}, Inserted={totalInserted}, Updated={totalUpdated}, SkippedRealtime={totalSkipped}");
+
                 } catch (OperationCanceledException) {
                     // shutdown
                 } catch (Exception ex) {
@@ -214,50 +141,135 @@ namespace MyBase.Services.MarketData {
             SafeLog("BackfillWorker: gestoppt.");
         }
 
-        // ------------------------------ HMDS (period=…) ------------------------------
-        private static async Task<List<Candle>> FetchHmdsByPeriodAsync(HttpClient client, string url, CancellationToken ct) {
-            // kleine, robuste Retry-Logik
-            for (int attempt = 1; attempt <= 3; attempt++) {
+        // ------------------------------ Fetch Logic (Daily) ------------------------------
+        
+        private async Task<List<Candle>> FetchDailyChunkAsync(HttpClient client, long conId, DateTime dayUtc, bool rthOnly, CancellationToken ct) {
+            // Parameter analog Python Script
+            // period=1d, bar=1min, startTime=YYYYMMDD-HH:mm:ss
+            // barType=midpoint (bleiben wir dabei, wie besprochen)
+            
+            var startTimeStr = dayUtc.ToString("yyyyMMdd-HH:mm:ss", CultureInfo.InvariantCulture);
+            var outsideRth = (!rthOnly).ToString().ToLowerInvariant();
+            var url = $"/v1/api/iserver/marketdata/history?conid={conId}&period=1d&bar=1min&outsideRth={outsideRth}&barType=midpoint&startTime={startTimeStr}";
+
+            const int maxRetries = 5;
+            const int retryDelayMs = 5000; // 5s
+
+            for (int attempt = 1; attempt <= maxRetries; attempt++) {
                 try {
                     using var r = await client.GetAsync(url, ct);
-                    var body = await r.Content.ReadAsStringAsync(ct);
                     var code = (int)r.StatusCode;
+                    var body = await r.Content.ReadAsStringAsync(ct);
 
                     if (r.IsSuccessStatusCode) {
                         var list = ParseHistory(body);
-                        SafeLog($"Backfill: OK ({code}) – {list.Count} Bars empfangen.");
+                        SafeLog($"Backfill: {dayUtc:yyyy-MM-dd} -> {list.Count} Bars (Versuch {attempt}).");
                         return list;
                     }
 
-                    // 5xx -> Retry, 429 -> kurzer Backoff
-                    if (code >= 500 || code == 429) {
-                        SafeLog($"Backfill: Server Error {code} – Retry {attempt}/3. Body: {TrimForLog(body)}");
-                        await Task.Delay(TimeSpan.FromMilliseconds(2000 * attempt), ct); // Noch längeres Delay
-                        continue;
+                    // Fehlerbehandlung
+                    SafeLog($"Backfill: {dayUtc:yyyy-MM-dd} Fehler {code} (Versuch {attempt}/{maxRetries}). Body: {TrimForLog(body)}");
+                    
+                    if (attempt < maxRetries) {
+                        await Task.Delay(retryDelayMs, ct);
                     }
-
-                    // andere Codes: protokollieren und zurück
-                    SafeLog($"Backfill: Fehler {code} :: {TrimForLog(body)}");
-                    return new List<Candle>();
-                } catch (Exception ex) when (attempt < 3) {
-                    SafeLog($"Backfill: Exception (Versuch {attempt}/3) – {ex.Message}");
-                    await Task.Delay(TimeSpan.FromMilliseconds(1000 * attempt), ct);
                 } catch (Exception ex) {
-                    SafeLog($"BackfillWorker: HMDS EX – {ex.Message}");
-                    break;
+                    SafeLog($"Backfill: Exception {dayUtc:yyyy-MM-dd} (Versuch {attempt}/{maxRetries}): {ex.Message}");
+                    if (attempt < maxRetries) {
+                        await Task.Delay(retryDelayMs, ct);
+                    }
                 }
             }
-            // Fallback: leer
-            SafeLog("BackfillWorker: HMDS leer nach Retries.");
+
+            SafeLog($"Backfill: {dayUtc:yyyy-MM-dd} -> Überspringe Tag nach {maxRetries} Versuchen.");
             return new List<Candle>();
         }
 
-        // ------------------------------ JSON Helpers ------------------------------
-        private static readonly JsonSerializerOptions JsonOpts =
-            new(JsonSerializerDefaults.Web) {
-                PropertyNameCaseInsensitive = true,
-                NumberHandling = JsonNumberHandling.AllowReadingFromString
-            };
+        // ------------------------------ DB Save Logic ------------------------------
+
+        private async Task<(int Inserted, int Updated, int Skipped)> SaveBarsAsync(AppDbContext db, int instrumentId, List<Candle> candles, string source, CancellationToken ct) {
+            if (candles.Count == 0) return (0, 0, 0);
+
+            try {
+                // Sortieren
+                candles = candles.OrderBy(c => c.TsUtc).ToList();
+                
+                var fromUtc = candles.First().TsUtc;
+                var toUtc = candles.Last().TsUtc;
+
+                // Existierende laden
+                var existingRows = await db.Bars1m
+                    .Where(b => b.InstrumentId == instrumentId && b.TsUtc >= fromUtc && b.TsUtc <= toUtc)
+                    .Select(b => new { b.TsUtc, b.IngestSource })
+                    .ToListAsync(ct);
+
+                var existingMap = existingRows.ToDictionary(x => x.TsUtc, x => x.IngestSource);
+
+                var toInsert = new List<Bar1m>(candles.Count);
+                var toUpdate = new List<Bar1m>();
+                int skippedRealtime = 0;
+
+                foreach (var c in candles) {
+                    var tsNy = IctTime.ToNy(c.TsUtc);
+                    var sess = IctTime.SessionOf(tsNy);
+                    var kz = IctTime.KillzoneOf(tsNy);
+
+                    var row = new Bar1m {
+                        InstrumentId = instrumentId,
+                        TsUtc = c.TsUtc,
+                        TsNy = tsNy,
+                        Open = (decimal)c.O,
+                        High = (decimal)c.H,
+                        Low = (decimal)c.L,
+                        Close = (decimal)c.C,
+                        Volume = 0, // midpoint
+                        Session = sess,
+                        Killzone = kz,
+                        IngestSource = source
+                    };
+
+                    if (existingMap.TryGetValue(c.TsUtc, out var src)) {
+                        if (string.Equals(src, "realtime", StringComparison.OrdinalIgnoreCase)) {
+                            skippedRealtime++;
+                            continue; 
+                        }
+                        toUpdate.Add(row);
+                    } else {
+                        toInsert.Add(row);
+                    }
+                }
+
+                if (toInsert.Count > 0)
+                    await db.Bars1m.AddRangeAsync(toInsert, ct);
+
+                if (toUpdate.Count > 0) {
+                    foreach (var e in toUpdate) {
+                        db.Bars1m.Attach(e);
+                        db.Entry(e).Property(x => x.TsNy).IsModified = true;
+                        db.Entry(e).Property(x => x.Open).IsModified = true;
+                        db.Entry(e).Property(x => x.High).IsModified = true;
+                        db.Entry(e).Property(x => x.Low).IsModified = true;
+                        db.Entry(e).Property(x => x.Close).IsModified = true;
+                        // Volume bleibt 0
+                        db.Entry(e).Property(x => x.Session).IsModified = true;
+                        db.Entry(e).Property(x => x.Killzone).IsModified = true;
+                        // Source nicht überschreiben
+                    }
+                }
+
+                await db.SaveChangesAsync(ct);
+                db.ChangeTracker.Clear();
+                
+                return (toInsert.Count, toUpdate.Count, skippedRealtime);
+
+            } catch (Exception ex) {
+                SafeLog($"Backfill: DB Save Error: {ex.Message}");
+                _log.LogError(ex, "DB Save Error");
+                return (0, 0, 0);
+            }
+        }
+
+        // ------------------------------ Helpers ------------------------------
 
         private static List<Candle> ParseHistory(string json) {
             try {
@@ -282,12 +294,15 @@ namespace MyBase.Services.MarketData {
 
         private static bool TryParseCandle(JsonElement el, out Candle c) {
             c = default;
-
             if (!TryParseTs(el, "t", out var tsUtc)) return false;
+            // IBKR liefert manchmal Strings, manchmal Numbers
             if (!TryGetDouble(el, "o", out var o)) return false;
             if (!TryGetDouble(el, "h", out var h)) return false;
             if (!TryGetDouble(el, "l", out var l)) return false;
             if (!TryGetDouble(el, "c", out var close)) return false;
+            
+            // Volumen ignorieren wir bei midpoint, aber falls wir trades nutzen würden:
+            // TryGetDouble(el, "v", out var v);
 
             c = new Candle {
                 TsUtc = tsUtc,
@@ -305,25 +320,16 @@ namespace MyBase.Services.MarketData {
 
             if (p.ValueKind == JsonValueKind.String) {
                 var s = p.GetString()!;
-                if (DateTime.TryParse(s, CultureInfo.InvariantCulture,
-                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out tsUtc))
-                    return true;
-
-                if (DateTime.TryParseExact(s, "yyyyMMdd-HH:mm:ss", CultureInfo.InvariantCulture,
-                        DateTimeStyles.AssumeUniversal, out var a)) {
+                // IBKR Formate variieren
+                if (DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out tsUtc)) return true;
+                if (DateTime.TryParseExact(s, "yyyyMMdd-HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var a)) {
                     tsUtc = DateTime.SpecifyKind(a, DateTimeKind.Utc);
-                    return true;
-                }
-                if (DateTime.TryParseExact(s, "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture,
-                        DateTimeStyles.AssumeUniversal, out var b)) {
-                    tsUtc = DateTime.SpecifyKind(b, DateTimeKind.Utc);
                     return true;
                 }
             } else if (p.ValueKind == JsonValueKind.Number && p.TryGetInt64(out var ms)) {
                 tsUtc = DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
                 return true;
             }
-
             return false;
         }
 

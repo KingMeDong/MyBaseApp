@@ -1,0 +1,77 @@
+1. Marktdaten & Vorbereitung
+
+Live-Daten empfangen (OHLCV, Zeitstempel, Volumen, Spread).
+
+Session-Filter (Premarket/Regular/Postmarket, Killzones).
+
+Datencontract: Standardisiertes Format (Bar + Indikator-Snapshots).
+
+2. Signal-Backbone (ICT-Setups)
+
+Market Structure (HH/HL/LH/LL).
+
+Liquidity Pools (Buy/Sell-Side Liquidity).
+
+Fair Value Gaps (FVG).
+
+Optimal Trade Entry (OTE).
+
+Order-/Breaker Blocks.
+
+Premium/Discount Arrays.
+
+➡ Ergebnis: Kandidat-Setup.
+
+3. Shadow-Simulator
+
+Simuliert Kandidat-Trades (inkl. Spread, Slippage, Gebühren).
+
+Überwacht TP/SL-Verhalten.
+
+Speichert Performance (MFE/MAE, PnL, Fills).
+
+4. p-Modell & EV-Berechnung
+
+Eingaben: Marktstruktur, Indikatoren, Volumen, Session, Spread.
+
+Ausgabe:
+
+p = Gewinnwahrscheinlichkeit (z. B. P(≥ +1R)).
+
+EV = Erwartungswert (muss positiv sein).
+
+5. Entscheidungs-Gate
+
+Bedingungen für Live-Trade:
+
+ICT-Setup gültig
+
+p ≥ Mindestwert
+
+EV > 0
+
+CRV ≥ Mindestwert
+
+Risiko-Management (Positionsgröße, Max. Risiko, Spread-Limit)
+
+➡ Nur wenn alle Bedingungen erfüllt → Trade freigegeben.
+
+6. Live-Execution
+
+Order an Broker (Market/Limit/Stop).
+
+TP/SL setzen.
+
+Orderbuch aktualisieren.
+
+Execution-Hygiene (Retries, Partial Fills, Latenzen).
+
+7. Nachverfolgung & Lernen
+
+Speichern aller Trades (Shadow + Live).
+
+Performance-Metriken: Winrate, EV realisiert, Drawdown, Sharpe.
+
+p-Modell regelmäßig neu trainieren (z. B. alle 500 Trades).
+
+Anpassung von Parametern bei Performance-Drift.

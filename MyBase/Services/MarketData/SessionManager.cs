@@ -83,7 +83,7 @@ public class SessionManager : BackgroundService {
                     (DateTime.UtcNow - lastTickle) > _heartbeat) {
                     await TickleAsync(client, stoppingToken);
                     lastTickle = DateTime.UtcNow;
-                    await UpdateHeartbeatAsync();
+                    // Heartbeat in DB nicht mehr nötig (macht MarketDataService)
                 }
 
                 await Task.Delay(1000, stoppingToken);
@@ -225,23 +225,7 @@ public class SessionManager : BackgroundService {
         }
     }
 
-    private async Task UpdateHeartbeatAsync() {
-        using var scope = _sp.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-        var inst = await db.Instruments.AsNoTracking()
-            .Where(i => i.IsActive)
-            .OrderBy(i => i.Id)
-            .FirstOrDefaultAsync();
-
-        if (inst is null) return;
-
-        var fs = await db.FeedStates.FindAsync(inst.Id) ?? new FeedState { InstrumentId = inst.Id };
-        fs.LastHeartbeatUtc = DateTime.UtcNow;
-
-        db.Update(fs);
-        await db.SaveChangesAsync();
-    }
 
     private async Task SetFeedLastErrorAsync(string msg) {
         using var scope = _sp.CreateScope();

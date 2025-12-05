@@ -35,12 +35,20 @@
     <div class="card">
       <div class="card-header">Backfill</div>
       <div class="card-body">
-        <label class="form-check">
+        <div class="mb-2">
+            <label class="form-label small text-muted">Start</label>
+            <input type="date" id="bfStart" class="form-control form-control-sm" style="background:#23293a; color:#fff; border:1px solid #343a40;" />
+        </div>
+        <div class="mb-2">
+            <label class="form-label small text-muted">Ende</label>
+            <input type="date" id="bfEnd" class="form-control form-control-sm" style="background:#23293a; color:#fff; border:1px solid #343a40;" />
+        </div>
+        <label class="form-check mb-2">
           <input id="rthOnly" type="checkbox" class="form-check-input" checked />
-          <span class="form-check-label">RTH-only (09:30 – 16:00 NY)</span>
+          <span class="form-check-label">RTH-only</span>
         </label>
-        <div class="mt-2">
-          <button class="btn btn-success" onclick="backfill1w()">Backfill 1 Woche</button>
+        <div>
+          <button class="btn btn-success w-100" onclick="startBackfill()">Start Backfill</button>
         </div>
       </div>
     </div>
@@ -152,12 +160,20 @@ async function stopFeed() {
   await fetch('/api/marketdata/stop', { method:'POST' });
   await refreshStatus();
 }
-async function backfill1w() {
+async function startBackfill() {
   const rth = document.querySelector('#rthOnly').checked;
-  await fetch('/api/backfill/start/1w', {
+  const startVal = document.querySelector('#bfStart').value;
+  const endVal = document.querySelector('#bfEnd').value;
+
+  const body = { RthOnly: rth };
+  
+  if (startVal) body.StartUtc = new Date(startVal).toISOString();
+  if (endVal)   body.EndUtc   = new Date(endVal).toISOString();
+
+  await fetch('/api/backfill/start', {
     method:'POST',
     headers:{ 'Content-Type':'application/json' },
-    body: JSON.stringify({ RthOnly: rth })
+    body: JSON.stringify(body)
   });
 }
 
@@ -179,6 +195,14 @@ function setupAuto() {
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
+  // Defaults setzen
+  const now = new Date();
+  const weekAgo = new Date();
+  weekAgo.setDate(now.getDate() - 7);
+  
+  document.getElementById('bfEnd').valueAsDate = now;
+  document.getElementById('bfStart').valueAsDate = weekAgo;
+
   await refreshStatus();
   await refreshLog();
   setupAuto();
